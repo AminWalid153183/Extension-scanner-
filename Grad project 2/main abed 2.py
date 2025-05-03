@@ -27,7 +27,6 @@ from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware 
 from dotenv import load_dotenv
 from starlette.middleware.base import BaseHTTPMiddleware
-import concurrent.futures
 
 
 
@@ -592,6 +591,7 @@ class ZAPScanner:
     def __init__(self, config: AnalysisConfig):
         if not config.zap_api_key:
             raise ValueError("ZAP_API_KEY environment variable not set!")
+        
         try:
             self.zap = ZAPv2(apikey=config.zap_api_key, proxies={'http': config.zap_proxy})
             # Test connection
@@ -602,27 +602,14 @@ class ZAPScanner:
 
     async def scan(self, target_url: str):
         print(f'Starting ZAP scan for {target_url}')
-        # Start spider and active scan concurrently for speed
-        spider_task = asyncio.to_thread(self.zap.spider.scan, target_url)
-        ascan_task = asyncio.to_thread(self.zap.ascan.scan, target_url)
-        scan_ids = await asyncio.gather(spider_task, ascan_task)
-        spider_id, ascan_id = scan_ids
-
-        # Poll both scans in parallel, but don't wait for 100% if >90% is reached (early exit)
-        async def poll_status(status_func, scan_id):
-            while True:
-                status = int(status_func(scan_id))
-                if status >= 90:
-                    break
-                await asyncio.sleep(0.5)
-
-        await asyncio.gather(
-            poll_status(self.zap.spider.status, spider_id),
-            poll_status(self.zap.ascan.status, ascan_id)
-        )
-
-        # Only wait a short time for alerts to be populated
-        await asyncio.sleep(1)
+        scan_id = self.zap.spider.scan(target_url)
+        while int(self.zap.spider.status(scan_id)) < 100:
+            await asyncio.sleep(1)
+        
+        ascan_id = self.zap.ascan.scan(target_url)
+        while int(self.zap.ascan.status(ascan_id)) < 100:
+            await asyncio.sleep(1)
+        
         return self.zap.core.alerts()
 
 class ExtensionHTTPServer:
@@ -653,13 +640,12 @@ class ExtensionHTTPServer:
             self.thread.join()
 
 class ExtensionSecurityAnalyzer:
-    def __init__(self, config: AnalysisConfig = None, file_hash_cache: dict = None):
+    def __init__(self, config: AnalysisConfig = None):
         self.config = config or AnalysisConfig()
         self.cfg_builder = CFGBuilder(self.config)
         self.taint_analyzer = TaintAnalyzer(self.config)
         self.chrome_adaptor = ChromeAdaptor(self.config)
         self.zap_scanner = ZAPScanner(self.config) if self.config.scan_level == 'aggressive' else None
-        self.file_hash_cache = file_hash_cache if file_hash_cache is not None else {}
 
     async def full_analysis(self, extension_path: Path, scan_level: str) -> Dict:
         results = {
@@ -679,72 +665,33 @@ class ExtensionSecurityAnalyzer:
             }
         }
 
+        # Always analyze manifest and YARA rules
+        # Manifest analysis
         manifest_path = extension_path.parent / "manifest.json"
-        manifest_task = asyncio.create_task(self.analyze_manifest(manifest_path)) if manifest_path.exists() else None
-
-        # Gather file paths to process (skip binaries early)
-        file_paths = [f for f in extension_path.rglob("*") if f.is_file() and f.suffix.lower() not in ['.png', '.jpg', '.jpeg', '.gif', '.zip', '.pdf']]
-        results["scan_progress"]["total"] = len(file_paths) + (1 if manifest_task else 0)
-
-        # Parallel file processing
-        async def process_file(file_path):
-            # --- Caching logic ---
-            try:
-                stat = file_path.stat()
-                hash_input = f"{file_path}:{stat.st_mtime}:{stat.st_size}".encode()
-                file_hash = hashlib.sha256(hash_input).hexdigest()
-                cache_key = str(file_path)
-                if self.file_hash_cache.get(cache_key) == file_hash:
-                    # Already analyzed, skip
-                    return ([], [], [])
-                self.file_hash_cache[cache_key] = file_hash
-            except Exception:
-                pass
-            # --- End caching logic ---
-            content = await self.read_file(file_path)
-            findings = []
-            js_risks = []
-            wasm_risks = []
-            if content:
-                findings = self.yara_scan(content, file_path)
-                if scan_level in ['medium', 'aggressive'] and file_path.suffix == ".js":
-                    js_results = await self.analyze_js(content, file_path, scan_level)
-                    js_risks = js_results["vulnerabilities"]
-                if scan_level == 'aggressive' and file_path.suffix == ".wasm":
-                    wasm_risks = await self.analyze_wasm(file_path)
-            return (findings, js_risks, wasm_risks)
-
-        # --- Limit concurrency ---
-        SEMAPHORE_LIMIT = 4  # Tune as needed for your system
-        semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
-        async def sem_task(fp):
-            async with semaphore:
-                return await process_file(fp)
-        # --- End concurrency limit ---
-
-        # Use asyncio.gather for parallel analysis
-        file_tasks = [sem_task(fp) for fp in file_paths]
-        file_results = await asyncio.gather(*file_tasks)
-
-        # Aggregate results
-        for findings, js_risks, wasm_risks in file_results:
-            results["yara_findings"].extend(findings)
-            results["js_risks"].extend(js_risks)
-            results["wasm_risks"].extend(wasm_risks)
-
-        # Manifest analysis (await if needed)
-        if manifest_task:
-            results["manifest_risks"] = await manifest_task
+        if (manifest_path.exists()):
+            results["manifest_risks"] = await self.analyze_manifest(manifest_path)
             results["scan_progress"]["current"] += 1
 
-        # Early exit for low/medium if high risk found
-        if scan_level in ['low', 'medium'] and any(r.get('level') == 'high' for r in results["manifest_risks"]):
-            results["risk_score"] = self.calculate_risk_score(results, scan_level)
-            results["risk_level"] = self.determine_risk_level(results["risk_score"])
-            results["scan_progress"]["status"] = "complete"
-            return results
+        # File processing based on scan level
+        processed_files = 0
+        for file_path in extension_path.rglob("*"):
+            if file_path.is_file():
+                processed_files += 1
+                results["scan_progress"]["current"] = processed_files
+                results["scan_progress"]["status"] = f"Processing {file_path.name}"
+                
+                content = await self.read_file(file_path)
+                if content:
+                    results["yara_findings"].extend(self.yara_scan(content, file_path))
+                    
+                    if scan_level in ['medium', 'aggressive'] and file_path.suffix == ".js":
+                        js_results = await self.analyze_js(content, file_path, scan_level)
+                        results["js_risks"].extend(js_results["vulnerabilities"])
+                    
+                    if scan_level == 'aggressive' and file_path.suffix == ".wasm":
+                        results["wasm_risks"].extend(await self.analyze_wasm(file_path))
 
-        # Dynamic analysis (aggressive only)
+        # Dynamic analysis
         if scan_level == 'aggressive':
             results["scan_progress"]["status"] = "Running dynamic analysis"
             results["dynamic_risks"] = await self.dynamic_analysis(extension_path)
@@ -928,42 +875,30 @@ async def scan_installed(request: Request, scan_level: str = 'medium'):
 
     config = AnalysisConfig()
     config.scan_level = scan_level
-    # --- Shared cache for this scan ---
-    file_hash_cache = {}
-    analyzer = ExtensionSecurityAnalyzer(config, file_hash_cache=file_hash_cache)
-    # --- End shared cache ---
-
+    analyzer = ExtensionSecurityAnalyzer(config)
+    
     extensions = [d for d in extensions_path.iterdir() if d.is_dir()]
     total = len(extensions)
     results = []
-
-    # --- Parallelize extension scans with concurrency limit ---
-    SEMAPHORE_LIMIT = 2  # Tune as needed for your system
-    semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
-    async def analyze_ext(idx, ext_dir):
-        async with semaphore:
-            try:
-                version_dirs = sorted(ext_dir.glob("*"), reverse=True)
-                if version_dirs:
-                    analysis = await analyzer.full_analysis(version_dirs[0], scan_level)
-                    return {
-                        "extension_id": analysis["extension_id"],
-                        "version": analysis["version"],
-                        "risk_score": analysis["risk_score"],
-                        "risk_level": analysis["risk_level"],
-                        "progress": f"{idx}/{total}"
-                    }
-            except Exception as e:
-                return {
-                    "extension_id": ext_dir.name,
-                    "error": str(e),
+    
+    for idx, ext_dir in enumerate(extensions, 1):
+        try:
+            version_dirs = sorted(ext_dir.glob("*"), reverse=True)
+            if version_dirs:
+                analysis = await analyzer.full_analysis(version_dirs[0], scan_level)
+                results.append({
+                    "extension_id": analysis["extension_id"],
+                    "version": analysis["version"],
+                    "risk_score": analysis["risk_score"],
+                    "risk_level": analysis["risk_level"],
                     "progress": f"{idx}/{total}"
-                }
-        return None
-
-    tasks = [analyze_ext(idx, ext_dir) for idx, ext_dir in enumerate(extensions, 1)]
-    results = [r for r in await asyncio.gather(*tasks) if r]
-    # --- End parallelization ---
+                })
+        except Exception as e:
+            results.append({
+                "extension_id": ext_dir.name,
+                "error": str(e),
+                "progress": f"{idx}/{total}"
+            })
 
     return JSONResponse(content={"extensions": results})
 
