@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Extension Security Scanner</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .controls {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+        }
+
+        select, button {
+            padding: 10px 15px;
+            font-size: 16px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }
+
+        button {
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+
+        button:disabled {
+            background-color: #a0a0a0;
+            cursor: not-allowed;
+        }
+
+        .progress {
+            text-align: center;
+            margin: 20px 0;
+            color: #666;
+        }
+
+        .results {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+
+        th {
+            background-color: #f8f9fa;
+        }
+
+        .risk-high { color: #dc3545; font-weight: bold; }
+        .risk-medium { color: #ffc107; font-weight: bold; }
+        .risk-low { color: #28a745; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Chrome Extension Security Scanner</h1>
+    </div>
+
+    <div class="controls">
+        <select id="scanLevel">
+            <option value="low">Low Intensity</option>
+            <option value="medium" selected>Medium Intensity</option>
+            <option value="aggressive">Aggressive</option>
+        </select>
+        <button id="scanButton" onclick="startScan()">Start Scan</button>
+    </div>
+
+    <div class="progress" id="progress" style="display: none;">
+        Scanning... <span id="progressText">0/0</span>
+    </div>
+
+    <div class="results">
+        <h2>Scan Results</h2>
+        <table id="resultsTable">
+            <thead>
+                <tr>
+                    <th>Extension ID</th>
+                    <th>Version</th>
+                    <th>Risk Score</th>
+                    <th>Risk Level</th>
+                </tr>
+            </thead>
+            <tbody id="resultsBody">
+                <!-- Results will be inserted here -->
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        async function startScan() {
+            const scanButton = document.getElementById('scanButton');
+            const progress = document.getElementById('progress');
+            const progressText = document.getElementById('progressText');
+            const scanLevel = document.getElementById('scanLevel').value;
+            
+            scanButton.disabled = true;
+            scanButton.textContent = 'Scanning...';
+            progress.style.display = 'block';
+
+            try {
+                const response = await fetch(`http://localhost:8000/scan-installed?scan_level=${scanLevel}`);
+                const data = await response.json();
+                
+                updateProgress(data.extensions.length, data.extensions.length);
+                displayResults(data.extensions);
+            } catch (error) {
+                console.error('Scan failed:', error);
+                alert('Scan failed. Check console for details.');
+            } finally {
+                scanButton.disabled = false;
+                scanButton.textContent = 'Start Scan';
+                progress.style.display = 'none';
+            }
+        }
+
+        function updateProgress(current, total) {
+            document.getElementById('progressText').textContent = `${current}/${total}`;
+        }
+
+        function displayResults(extensions) {
+            const tbody = document.getElementById('resultsBody');
+            tbody.innerHTML = '';
+
+            extensions.forEach(ext => {
+                const row = document.createElement('tr');
+                
+                row.innerHTML = `
+                    <td>${ext.extension_id}</td>
+                    <td>${ext.version}</td>
+                    <td>${ext.risk_score?.toFixed(1) || 'N/A'}</td>
+                    <td class="${getRiskClass(ext.risk_level)}">${ext.risk_level}</td>
+                `;
+
+                tbody.appendChild(row);
+            });
+        }
+
+        function getRiskClass(riskLevel) {
+            switch (riskLevel?.toLowerCase()) {
+                case 'high': return 'risk-high';
+                case 'medium': return 'risk-medium';
+                case 'low': return 'risk-low';
+                default: return '';
+            }
+        }
+    </script>
+</body>
+</html>
