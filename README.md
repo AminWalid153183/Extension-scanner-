@@ -93,7 +93,6 @@ scans: Sessions for scans
 
 scan_results: Results for each extension
 
-users, permissions, logs: Extra entities for tracking and auditing
 
 Team Members
 Amin Walid Al-Tamimi (Team Leader)
